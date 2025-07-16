@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import re
 import pdfplumber
 import tiktoken
 import pandas as pd
@@ -28,21 +29,17 @@ if st.button("Generovat Excel"):
 
     # 3.1) Validace vstupů
     if not openai.api_key:
-        st.error("Chybí API klíč OpenAI")
-        st.stop()
+        st.error("Chybí API klíč OpenAI"); st.stop()
     if not uploaded_files:
-        st.error("Nenahráli jste žádné soubory")
-        st.stop()
+        st.error("Nenahráli jste žádné soubory"); st.stop()
 
     # Roztřídění souborů podle přípony
     pdfs = [f for f in uploaded_files if f.name.lower().endswith(".pdf")]
     txts = [f for f in uploaded_files if f.name.lower().endswith(".txt")]
     if not pdfs:
-        st.error("Chybí PDF soubor(y)")
-        st.stop()
+        st.error("Chybí PDF soubor(y)"); st.stop()
     if not txts:
-        st.error("Chybí textový ceník (.txt)")
-        st.stop()
+        st.error("Chybí textový ceník (.txt)"); st.stop()
 
     pdf_file = pdfs[0]
     cenik_file = txts[0]
@@ -52,6 +49,12 @@ if st.button("Generovat Excel"):
         pdf_bytes = pdf_file.read()
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             full_text = "\n\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    # ——— 4.5) Izolace tabulkových řádků ————————————————————
+    lines = full_text.splitlines()
+    table_lines = [l for l in lines if re.match(r"^\d{2,3}x\d{2,3}", l) and "HLA" in l]
+    header = next((l for l in lines if "Sizes" in l and "Pieces" in l), "")
+    table_text = (header + "\n" + "\n".join(table_lines)) if header else "\n".join(table_lines)
 
     # ——— 5) Načtení ceníku ————————————————————————————
     with st.spinner("Načítám ceník…"):
@@ -66,14 +69,14 @@ if st.button("Generovat Excel"):
                     pass
     st.write(f"Nahráno {len(cenik)} cenových záznamů")
 
-    # ——— 6) Helper pro chunking textu —————————————————————
+    # ——— 6) Chunking helper ——————————————————————————
     def chunk_text(text: str, max_tokens: int = 1500):
         enc = tiktoken.encoding_for_model("gpt-4")
         tokens = enc.encode(text)
         for i in range(0, len(tokens), max_tokens):
             yield enc.decode(tokens[i : i + max_tokens])
 
-    # ——— 7) Prompt template s .format() ————————————————————
+    # ——— 7) Prompt template ——————————————————————————
     base_prompt_template = '''You are an expert at extracting structured data from product catalogs.
 Generate a JSON array of all products with exactly these columns (A–U) in Czech:
 
@@ -108,7 +111,7 @@ Use the following ceník mapping (key→price):
     # ——— 8) Volání GPT pro každý chunk —————————————————————
     products = []
     cenik_json = json.dumps(cenik, ensure_ascii=False)
-    chunks = list(chunk_text(full_text))
+    chunks = list(chunk_text(table_text))
     for idx, chunk in enumerate(chunks, start=1):
         with st.spinner(f"Volám GPT pro chunk {idx}/{len(chunks)}…"):
             prompt = base_prompt_template.format(
