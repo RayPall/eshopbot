@@ -1,171 +1,117 @@
-import os
 import io
-import json
 import re
+import json
+import camelot        # pip install camelot-py[cv]
 import pdfplumber
-import tiktoken
 import pandas as pd
-import streamlit as st
 import openai
 
-# ——— Streamlit UI ——————————————————————————————————————————————
-st.set_page_config(page_title="PDF→Excel with GPT", layout="centered")
-st.title("PDF → Structured Excel via OpenAI GPT")
+# ——— 1) Nastavení OpenAI klíče ——————————————————————————————
+openai.api_key = "OPENAI_API_KEY"
 
-# 1) API key
-openai.api_key = (
-    os.getenv("OPENAI_API_KEY")
-    or st.text_input("OpenAI API key", type="password", help="Set env var OPENAI_API_KEY or paste here")
-)
+# ——— 2) Definice sloupců A–U ——————————————————————————————
+COLUMNS = [
+    ("A","Název Keramičky"),
+    ("B","Název kolekce"),
+    ("C","Produktový kód"),
+    ("D","Název produktu"),
+    ("E","Barva"),
+    ("F","Materiál - Rektifikovaný (0/1)"),
+    ("G","Povrch (Matný/Lesklý)"),
+    ("H","Hlavní obrázek (valid URL)"),
+    ("I","Váha (kg)"),
+    ("J","Šířka"),
+    ("K","Výška"),
+    ("L","Tloušťka"),
+    ("M","Specifikace (Protiskluz R9–R12)"),
+    ("N","Tvar"),
+    ("O","Estetický vzhled"),
+    ("P","Cena (EUR)"),
+    ("Q","Materiál (typ střepu)"),
+    ("R","Použití"),
+    ("S","Hlavní kategorie"),
+    ("T","Jednotka"),
+    ("U","Velikost balení"),
+]
 
-# 2) Universal file uploader
-st.markdown("### 1️⃣ Nahrajte libovolné soubory (PDF katalogy, ceníky, obrázky…)")
-uploaded_files = st.file_uploader(
-    "Vyberte všechny relevantní soubory najednou",
-    type=None,
-    accept_multiple_files=True
-)
+# ——— 3) Základní prompt pro LLM ——————————————————————————
+BASE_PROMPT = """
+Máš za úkol extrahovat všechny produkty z katalogu do JSON pole, kde každý objekt obsahuje přesně tyto sloupce A–U (klíče "A" až "U"):
 
-# 3) Pokud jsou nahrané, požádejte o mapování rolí
-catalog_file = None
-price_file = None
-if uploaded_files:
-    names = [f.name for f in uploaded_files]
-    st.markdown("### 2️⃣ Přiřaďte role souborům")
-    catalog_choice = st.selectbox("Vyberte soubor s produktovým katalogem", options=["—"] + names)
-    price_choice   = st.selectbox("Vyberte soubor s ceníkem",              options=["—"] + names)
+{cols}
 
-    if catalog_choice != "—" and price_choice != "—":
-        catalog_file = next(f for f in uploaded_files if f.name == catalog_choice)
-        price_file   = next(f for f in uploaded_files if f.name == price_choice)
+Níže je vstupní text z PDF (nebo čistý text v případě selhání tabulkového parseru). Vrať pouze JSON pole, bez dalšího komentáře:
 
-# 4) Spouštěcí tlačítko
-if st.button("Generovat Excel"):
+---
+{data}
+---
+""".strip()
 
-    # 4.1) Validace vstupů
-    if not openai.api_key:
-        st.error("Chybí API klíč OpenAI"); st.stop()
-    if catalog_file is None:
-        st.error("Musíte vybrat soubor s produktovým katalogem"); st.stop()
-    if price_file   is None:
-        st.error("Musíte vybrat soubor s ceníkem"); st.stop()
+def parse_price_file(raw_text: str) -> dict:
+    """
+    Z libovolného textu (ceník.txt, CSV, TSV) vytáhne mapování
+    klíč→cena (float).
+    """
+    price_map = {}
+    for line in raw_text.splitlines():
+        # hledáme vzor např. "60x60 - Rettificato    12,25 €"
+        m = re.match(r"(.+?)\s+([\d.,]+)\s*€", line)
+        if m:
+            key = m.group(1).strip()
+            price = float(m.group(2).replace(",", "."))
+            price_map[key] = price
+    return price_map
 
-    # ——— 5) Extrakce textu z katalogu —————————————————————
-    with st.spinner("Extrahuji text z katalogu…"):
-        data = catalog_file.read()
-        # předpokládejme PDF; pokud není PDF, raw text parse selže
-        try:
-            with pdfplumber.open(io.BytesIO(data)) as pdf:
-                full_text = "\n\n".join(page.extract_text() or "" for page in pdf.pages)
-        except Exception:
-            # fallback: pokus o plain-text zbytek
-            full_text = data.decode("utf-8", errors="ignore")
+def parse_pdf_universal(pdf_bytes: bytes, price_map: dict) -> pd.DataFrame:
+    """
+    1) Zkus camelot na detekci tabulek
+    2) Pokud selže, fallback na pdfplumber + LLM podle BASE_PROMPT
+    """
+    # 1) Camelot
+    try:
+        tables = camelot.read_pdf(io.BytesIO(pdf_bytes), pages="all", flavor="stream")
+        if tables and len(tables) > 0:
+            # vyber největší tabulku
+            df = max((t.df for t in tables), key=lambda d: d.shape[0])
+            df.columns = df.iloc[0]  # první řádek jako hlavičky
+            df = df.drop(0).reset_index(drop=True)
+            return df
+    except Exception:
+        pass
 
-    # ——— 5.5) Izolace tabulkových řádků ————————————————————
-    lines = full_text.splitlines()
-    table_lines = [l for l in lines if re.match(r"^\d{2,3}x\d{2,3}", l) and "HLA" in l]
-    header = next((l for l in lines if "Sizes" in l and "Pieces" in l), "")
-    table_text = (header + "\n" + "\n".join(table_lines)) if header else "\n".join(table_lines)
+    # 2) Fallback: čistý text
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = "\n\n".join(p.extract_text() or "" for p in pdf.pages)
 
-    # ——— 6) Načtení ceníku ————————————————————————————
-    with st.spinner("Načítám ceník…"):
-        raw = price_file.getvalue().decode("utf-8", errors="ignore")
-        cenik = {}
-        for line in raw.splitlines():
-            parts = [p.strip() for p in re.split(r"[;|\t|,]?", line) if "€" in line or line.count(" ")>1]
-            # pokus najít klíč a cenu
-            m = re.match(r"(.+?)\s+([\d.,]+)\s*€", line)
-            if m:
-                key, price = m.group(1).strip(), m.group(2).replace(",", ".")
-                try:
-                    cenik[key] = float(price)
-                except:
-                    pass
+    # Sestav prompt
+    cols_descr = "\n".join(f"{k}: {v}" for k,v in COLUMNS)
+    prompt = BASE_PROMPT.format(cols=cols_descr, data=text)
 
-    if not cenik:
-        st.warning("Ceník načten, ale neobsahuje žádné položky. Používám prázdné mapování.")
-    else:
-        st.write(f"Načteno {len(cenik)} položek z ceníku")
-
-    cenik_json = json.dumps(cenik, ensure_ascii=False)
-
-    # ——— 7) Helper pro chunking ——————————————————————————
-    def chunk_text(text: str, max_tokens: int = 1500):
-        enc = tiktoken.encoding_for_model("gpt-4")
-        tokens = enc.encode(text)
-        for i in range(0, len(tokens), max_tokens):
-            yield enc.decode(tokens[i : i + max_tokens])
-
-    # ——— 8) Prompt template ——————————————————————————
-    base_prompt_template = '''You are an expert at extracting structured data from product catalogs.
-Generate a JSON array of all products with exactly these columns (A–U) in Czech:
-
-A: Název Keramičky  
-B: Název kolekce  
-C: Produktový kód  
-D: Název produktu  
-E: Barva  
-F: Materiál - Rektifikovaný (0/1)  
-G: Povrch (Matný/Lesklý)  
-H: Hlavní obrázek (valid URL)  
-I: Váha (kg)  
-J: Šířka  
-K: Výška  
-L: Tloušťka  
-M: Specifikace (Protiskluz R9–R12)  
-N: Tvar  
-O: Estetický vzhled  
-P: Cena (EUR, from ceník)  
-Q: Materiál (typ střepu)  
-R: Použití  
-S: Hlavní kategorie  
-T: Jednotka  
-U: Velikost balení
-
-Use the following ceník mapping (key→price):
-```json
-{cenik_json}
-Now parse the following PDF text and output only valid JSON (no narrative, just the array):
-{pdf_text_chunk}
-```'''
-
-    # ——— 9) Volání GPT a sběr výsledků —————————————————————
-    products = []
-    chunks = list(chunk_text(table_text))
-    for idx, chunk in enumerate(chunks, start=1):
-        with st.spinner(f"Volám GPT pro chunk {idx}/{len(chunks)}…"):
-            prompt = base_prompt_template.format(
-                cenik_json=cenik_json,
-                pdf_text_chunk=chunk
-            )
-            resp = openai.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=2000,
-            )
-        text = resp.choices[0].message.content.strip()
-        try:
-            data = json.loads(text)
-            products.extend(data)
-        except json.JSONDecodeError as e:
-            st.error(f"Chyba JSON v chunku {idx}: {e}")
-            st.code(text)
-            st.stop()
-
-    st.success(f"Extrahováno celkem {len(products)} produktů")
-
-    # ——— 10) Sestavení DataFrame & export ————————————————————
-    with st.spinner("Sestavuji Excel…"):
-        df = pd.DataFrame(products)
-        df["P"] = df.apply(lambda r: r.get("P") or cenik.get(r.get("C")), axis=1)
-        out = io.BytesIO()
-        df.to_excel(out, index=False, sheet_name="Products")
-
-    st.success("Hotovo! Excel je připraven.")
-    st.download_button(
-        "📥 Stáhnout Excel",
-        out.getvalue(),
-        file_name="products.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    resp = openai.chat.completions.create(
+        model="gpt-4",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0,
+        max_tokens=2000,
     )
+    content = resp.choices[0].message.content.strip()
+
+    # Parse JSON pole
+    data = json.loads(content)
+    return pd.DataFrame(data)
+
+if __name__ == "__main__":
+    # ——— Příklad načtení souborů z disku ——————————————————
+    with open("Del-Conca-Lavaredo-Katalog-produktu.pdf", "rb") as f:
+        pdf_bytes = f.read()
+    raw_cenik = open("cenik.txt", "r", encoding="utf-8").read()
+
+    # ——— Připrav ceník dict ——————————————————————————
+    price_map = parse_price_file(raw_cenik)
+    print(f"Načteno {len(price_map)} cenových záznamů")
+
+    # ——— Spusť univerzální parser ——————————————————————
+    df = parse_pdf_universal(pdf_bytes, price_map)
+
+    # ——— Vypsání výsledku nebo uložení —————————————————————
+    print(df.head())
+    df.to_excel("vystup_products.xlsx", index=False)
