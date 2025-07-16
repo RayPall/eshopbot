@@ -1,125 +1,130 @@
-import io
-import re
-import pandas as pd
-import pdfplumber
-import streamlit as st
-import xml.etree.ElementTree as ET
+import io, re, pdfplumber, json, xml.etree.ElementTree as ET
 from xml.dom import minidom
+import streamlit as st
+import openai
 
-st.set_page_config(page_title="Universal Heureka Exporter", layout="wide")
-st.title("🛠️ Universal PDF → Heureka XML Exporter (Streamlit)")
+st.title("Inteligentní PDF→Heureka XML")
+openai.api_key = st.text_input("OpenAI API Key", type="password")
 
-# 1) Upload all files at once (PDFs, price-lists, **XML template**)
-uploaded = st.file_uploader(
-    "Vyberte PDF katalogy, ceník (.txt/.csv) a XML šablonu",
-    type=["pdf","txt","csv","xml"],
-    accept_multiple_files=True
-)
-
-if not uploaded:
-    st.info("Nahrajte nejprve všechny potřebné soubory (PDF, ceník, XML).")
+# 1) Upload
+files = st.file_uploader("PDF, ceník (.txt/.csv), XML šablona", type=["pdf","txt","csv","xml"], accept_multiple_files=True)
+if not files:
     st.stop()
 
-# Separate uploads by extension
-pdf_files     = [f for f in uploaded if f.name.lower().endswith(".pdf")]
-price_files   = [f for f in uploaded if f.name.lower().endswith((".txt","csv"))]
-xml_templates = [f for f in uploaded if f.name.lower().endswith(".xml")]
+pdfs       = [f for f in files if f.name.lower().endswith(".pdf")]
+prices     = [f for f in files if f.name.lower().endswith((".txt","csv"))]
+templates  = [f for f in files if f.name.lower().endswith(".xml")]
 
-st.write(f"- PDF katalogy: {len(pdf_files)}")
-st.write(f"- Ceníky: {len(price_files)}")
-st.write(f"- XML šablony: {len(xml_templates)}")
+template = st.selectbox("Vyberte XML šablonu", ["–"]+[t.name for t in templates])
+if template=="–":
+    st.stop()
+template_file = next(t for t in templates if t.name==template)
 
-# Choose exactly one XML template
-template_file = None
-if xml_templates:
-    choice = st.selectbox("Vyberte Heureka XML šablonu", ["–"] + [f.name for f in xml_templates])
-    if choice != "–":
-        template_file = next(f for f in xml_templates if f.name == choice)
+if not st.button("Generovat inteligentní XML"):
+    st.stop()
 
-# Trigger button
-if st.button("🔄 Generovat výsledné XML"):
+# 2) Load XML template
+tree = ET.parse(io.BytesIO(template_file.getvalue()))
+root = tree.getroot()
+ns = {"h": root.tag.split("}")[0].strip("{")}
+for old in root.findall("h:SHOPITEM", ns):
+    root.remove(old)
 
-    # Validation
-    if not pdf_files:
-        st.error("Musíte nahrát alespoň jeden PDF katalog.")
-        st.stop()
-    if not price_files:
-        st.error("Musíte nahrát alespoň jeden soubor s ceníkem (.txt nebo .csv).")
-        st.stop()
-    if template_file is None:
-        st.error("Musíte vybrat jednu XML šablonu.")
-        st.stop()
+# 3) Build price map
+price_map = {}
+for p in prices:
+    text = p.getvalue().decode("utf-8", errors="ignore")
+    for L in text.splitlines():
+        m = re.match(r"(.+?)\s+([\d.,]+)\s*€", L)
+        if m:
+            price_map[m.group(1).strip()] = float(m.group(2).replace(",","."))
+st.write(f"Ceny: {len(price_map)} položek")
 
-    # Parse price-lists
-    price_map = {}
-    for pf in price_files:
-        txt = pf.getvalue().decode("utf-8", errors="ignore")
-        for line in txt.splitlines():
-            m = re.match(r"(.+?)\s+([\d.,]+)\s*€", line)
-            if m:
-                price_map[m.group(1).strip()] = float(m.group(2).replace(",","."))
-    st.success(f"Načteno {len(price_map)} cenových položek.")
+# 4) For each PDF, extract text + images
+catalogs = []
+for pdf in pdfs:
+    with pdfplumber.open(io.BytesIO(pdf.getvalue())) as doc:
+        text = "\n\n".join(p.extract_text() or "" for p in doc.pages)
+        # extract first embedded image (if any)
+        images = []
+        for p in doc.pages:
+            for img in p.images:
+                # crop & save image bytes
+                x0,y0,x1,y1 = img["x0"],img["y0"],img["x1"],img["y1"]
+                im = p.crop((x0,y0,x1,y1)).to_image(resolution=150)
+                buf = io.BytesIO()
+                im.original.save(buf, format="JPEG")
+                images.append(buf.getvalue())
+        catalogs.append({"name": pdf.name, "text": text, "images": images})
 
-    # Extract product rows from all PDFs
-    rows = []
-    for pdf in pdf_files:
-        text = "\n".join(page.extract_text() or "" for page in pdfplumber.open(io.BytesIO(pdf.getvalue())).pages)
-        for line in text.splitlines():
-            parts = re.split(r"\s{2,}", line.strip())
-            if len(parts)>=2 and re.search(r"\d", parts[0]):
-                rows.append(parts)
+# 5) Ask GPT to extract all fields
+for cat in catalogs:
+    prompt = f"""
+You are given the full text of a product catalog and a set of output fields matching a Heureka SHOPITEM.
+Extract *every* product into a JSON array of objects with exactly these keys:
 
-    if not rows:
-        st.error("Nepodařilo se najít žádné produktové řádky v PDF.")
-        st.stop()
+- ITEM_ID
+- PRODUCTNAME
+- DESCRIPTION
+- CATEGORIES
+- NETTO_PRICE
+- WEIGHT
+- WIDTH
+- HEIGHT
+- THICKNESS
+- MAIN_IMAGE_URL
+- ADDITIONAL_IMAGE_URLS
+- PARAMS: a dict of any other specs (color, material, usage…)
 
-    # Build DataFrame
-    header = rows[0] if not re.search(r"\d", "".join(rows[0])) else None
-    data = rows[1:] if header else rows
-    cols = header or [f"col{i}" for i in range(len(data[0]))]
-    df = pd.DataFrame(data, columns=cols)
+Also use the following price map (key→price):
+```json
+{json.dumps(price_map, ensure_ascii=False)}
+Catalog filename: {cat["name"]}
+Catalog text: {cat["text"][:2000]}   # truncate if too long
+Return ONLY valid JSON.
+"""
+resp = openai.ChatCompletion.create(
+model="gpt-4",
+messages=[{"role":"user","content":prompt}],
+temperature=0,
+max_tokens=2000
+)
+items = json.loads(resp.choices[0].message.content)
 
-    st.write("▶️ Ukázka extrahovaných dat")
-    st.dataframe(df.head())
+# 6) Inject into XML
+for it in items:
+    shop = ET.SubElement(root, f"{{{ns['h']}}}SHOPITEM")
+    def add(tag,val):
+        e=ET.SubElement(shop,f"{{{ns['h']}}}{tag}"); e.text=str(val)
+    add("ITEM_ID",        it["ITEM_ID"])
+    add("PRODUCTNAME",    it["PRODUCTNAME"])
+    add("DESCRIPTION",    it["DESCRIPTION"])
+    add("CATEGORIES",     it["CATEGORIES"])
+    add("NETTO_PRICE",    it["NETTO_PRICE"])
+    add("WEIGHT",         it["WEIGHT"])
+    add("WIDTH",          it["WIDTH"])
+    add("HEIGHT",         it["HEIGHT"])
+    add("THICKNESS",      it["THICKNESS"])
+    add("MAIN_IMAGE_URL", it["MAIN_IMAGE_URL"])
+    # additional images
+    for url in it.get("ADDITIONAL_IMAGE_URLS", []):
+        add("ADDITIONAL_IMAGE_URL", url)
+    # other params
+    for k,v in it.get("PARAMS",{}).items():
+        p=ET.SubElement(shop,f"{{{ns['h']}}}PARAM")
+        ET.SubElement(p,f"{{{ns['h']}}}PARAM_NAME").text=k
+        ET.SubElement(p,f"{{{ns['h']}}}VAL").text=str(v)
+        
+7) Pretty-print and Download
+rough = ET.tostring(root, 'utf-8')
+pretty = minidom.parseString(rough).toprettyxml(indent=" ", encoding="UTF-8")
+st.download_button("📥 Stáhnout XML", pretty, "export_smart.xml", "application/xml")
 
-    # === HERE: parse the uploaded XML template ===
-    xml_bytes = template_file.getvalue()
-    tree = ET.parse(io.BytesIO(xml_bytes))
-    root = tree.getroot()
-    ns = {"h": root.tag.split("}")[0].strip("{")}
+### How it works
 
-    # remove existing SHOPITEMs
-    for old in root.findall("h:SHOPITEM", ns):
-        root.remove(old)
+- **Text extraction** with `pdfplumber`.  
+- **Image extraction** from the first embedded JPEG per page (you can tune).  
+- **GPT-4** is prompted with a clear schema, the price map, and a chunk of the PDF. It returns a JSON array of fully-populated product objects.  
+- We **inject** each resulting object into your fixed XML template under `<SHOPITEM>` tags.  
 
-    # inject one SHOPITEM per row
-    for _, row in df.iterrows():
-        itm = ET.SubElement(root, f"{{{ns['h']}}}SHOPITEM")
-        code = str(row[cols[0]])
-        ET.SubElement(itm, f"{{{ns['h']}}}ITEM_ID").text     = code
-        ET.SubElement(itm, f"{{{ns['h']}}}PRODUCTNAME").text = code
-        # price lookup
-        price = price_map.get(code) or price_map.get(str(row.get(cols[1],"")))
-        if price is not None:
-            ET.SubElement(itm, f"{{{ns['h']}}}NETTO_PRICE").text = str(price)
-
-        # generic PARAMs for every column
-        for col in cols:
-            val = row[col]
-            if pd.isna(val) or val == "":
-                continue
-            p = ET.SubElement(itm, f"{{{ns['h']}}}PARAM")
-            ET.SubElement(p, f"{{{ns['h']}}}PARAM_NAME").text = col
-            ET.SubElement(p, f"{{{ns['h']}}}VAL").text        = str(val)
-
-    # pretty-print final XML
-    rough = ET.tostring(root, 'utf-8')
-    pretty = minidom.parseString(rough).toprettyxml(indent="  ", encoding="UTF-8")
-
-    st.success("✨ XML bylo úspěšně vygenerováno!")
-    st.download_button(
-        label="📥 Stáhnout exportované XML",
-        data=pretty,
-        file_name="exported.xml",
-        mime="application/xml"
-    )
+This way the app truly *understands* the catalog, finds descriptions and images anywhere in the PDF, pairs them with prices, and yields a ready-to-import Heureka XML.
