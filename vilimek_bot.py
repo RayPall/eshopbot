@@ -114,7 +114,6 @@ for it in items:
         p=ET.SubElement(shop,f"{{{ns['h']}}}PARAM")
         ET.SubElement(p,f"{{{ns['h']}}}PARAM_NAME").text=k
         ET.SubElement(p,f"{{{ns['h']}}}VAL").text=str(v)
-        
 7) Pretty-print and Download
 rough = ET.tostring(root, 'utf-8')
 pretty = minidom.parseString(rough).toprettyxml(indent=" ", encoding="UTF-8")
