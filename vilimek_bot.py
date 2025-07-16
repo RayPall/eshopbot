@@ -3,7 +3,7 @@ import sys
 import io
 import re
 import json
-import camelot        # pip install camelot-py[cv]
+import camelot
 import pdfplumber
 import pandas as pd
 import openai
@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
 # ——— 1) Configure your OpenAI API key ——————————————————————————————
-openai.api_key = "YOUR_OPENAI_API_KEY"  # Or set via environment variable
+openai.api_key = "OPENAI_API_KEY"  # Or set via environment variable
 
 # ——— 2) Heureka XML namespace & columns A–U definition ——————————————
 NS = "http://www.heureka.cz/ns/offer/1.0"
