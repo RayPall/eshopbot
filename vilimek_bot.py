@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import json
 import pdfplumber
@@ -11,9 +12,9 @@ st.set_page_config(page_title="Inteligentní PDF→Heureka XML", layout="wide")
 st.title("🛠️ Inteligentní PDF → Heureka XML Exporter")
 
 # ——— 1) API Key ——————————————————————————————————————————————
-openai.api_key = st.text_input("OpenAI API Key", type="password")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
-    st.info("Zadejte svůj OpenAI API key výše.")
+    st.error("Chybí proměnná prostředí OPENAI_API_KEY. Nastavte ji v Secrets.")
     st.stop()
 
 # ——— 2) File Uploader —————————————————————————————————————————
