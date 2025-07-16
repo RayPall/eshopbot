@@ -7,11 +7,11 @@ import pandas as pd
 import streamlit as st
 import openai
 
-# Streamlit config
+# ——— Streamlit UI ——————————————————————————————————————————————
 st.set_page_config(page_title="PDF→Excel with GPT", layout="centered")
 st.title("PDF → Structured Excel via OpenAI GPT")
 
-# 1) API key input
+# 1) API key
 openai.api_key = (
     os.getenv("OPENAI_API_KEY")
     or st.text_input("OpenAI API key", type="password", help="Set env var OPENAI_API_KEY or paste here")
@@ -20,37 +20,40 @@ openai.api_key = (
 # 2) Universal file uploader
 st.markdown("### 1️⃣ Nahrajte vstupní soubory (PDF, ceník, nebo jiné)")
 uploaded_files = st.file_uploader(
-    "Vyberte všechny soubory najednou",
-    type=None,
-    accept_multiple_files=True
+    "Vyberte všechny soubory najednou", type=None, accept_multiple_files=True
 )
 
-# 3) Start button
+# 3) Spouštěcí tlačítko
 if st.button("Generovat Excel"):
 
-    # Validate inputs
+    # 3.1) Validace vstupů
     if not openai.api_key:
-        st.error("Chybí API klíč OpenAI"); st.stop()
+        st.error("Chybí API klíč OpenAI")
+        st.stop()
     if not uploaded_files:
-        st.error("Nenahráli jste žádné soubory"); st.stop()
+        st.error("Nenahráli jste žádné soubory")
+        st.stop()
 
-    # Separate PDF and TXT
+    # Roztřídění souborů podle přípony
     pdfs = [f for f in uploaded_files if f.name.lower().endswith(".pdf")]
     txts = [f for f in uploaded_files if f.name.lower().endswith(".txt")]
     if not pdfs:
-        st.error("Chybí PDF soubor(y)"); st.stop()
+        st.error("Chybí PDF soubor(y)")
+        st.stop()
     if not txts:
-        st.error("Chybí textový ceník (.txt)"); st.stop()
+        st.error("Chybí textový ceník (.txt)")
+        st.stop()
 
     pdf_file = pdfs[0]
     cenik_file = txts[0]
-# 4) Extract full text from PDF
+
+    # ——— 4) Extrakce textu z PDF ——————————————————————————
     with st.spinner("Extrahuji text z PDF…"):
         pdf_bytes = pdf_file.read()
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             full_text = "\n\n".join(page.extract_text() or "" for page in pdf.pages)
 
-# 5) Load ceník
+    # ——— 5) Načtení ceníku ————————————————————————————
     with st.spinner("Načítám ceník…"):
         cenik = {}
         for line in cenik_file.getvalue().decode("utf-8").splitlines():
@@ -63,14 +66,14 @@ if st.button("Generovat Excel"):
                     pass
     st.write(f"Nahráno {len(cenik)} cenových záznamů")
 
-# 6) Chunking helper
-    def chunk_text(text, max_tokens=1500):
+    # ——— 6) Helper pro chunking textu —————————————————————
+    def chunk_text(text: str, max_tokens: int = 1500):
         enc = tiktoken.encoding_for_model("gpt-4")
         tokens = enc.encode(text)
         for i in range(0, len(tokens), max_tokens):
-            yield enc.decode(tokens[i:i+max_tokens])
+            yield enc.decode(tokens[i : i + max_tokens])
 
- # 7) Prompt template
+    # ——— 7) Prompt template s .format() ————————————————————
     base_prompt_template = '''You are an expert at extracting structured data from product catalogs.
 Generate a JSON array of all products with exactly these columns (A–U) in Czech:
 
@@ -101,19 +104,20 @@ Use the following ceník mapping (key→price):
 {cenik_json}
 {pdf_text_chunk}
 ```'''
-# 8) Call GPT per chunk
+
+    # ——— 8) Volání GPT pro každý chunk —————————————————————
     products = []
     cenik_json = json.dumps(cenik, ensure_ascii=False)
     chunks = list(chunk_text(full_text))
-    for idx, chunk in enumerate(chunks, 1):
+    for idx, chunk in enumerate(chunks, start=1):
         with st.spinner(f"Volám GPT pro chunk {idx}/{len(chunks)}…"):
             prompt = base_prompt_template.format(
                 cenik_json=cenik_json,
                 pdf_text_chunk=chunk
             )
-            resp = openai.ChatCompletion.create(
+            resp = openai.chat.completions.create(
                 model="gpt-4",
-                messages=[{"role":"user","content":prompt}],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0,
                 max_tokens=2000,
             )
@@ -126,18 +130,18 @@ Use the following ceník mapping (key→price):
             st.code(text)
             st.stop()
     st.success(f"Extrahováno {len(products)} produktů")
-# 9) Build DataFrame & Excel
+
+    # ——— 9) Sestavení DataFrame a export do Excel —————————————————
     with st.spinner("Sestavuji Excel…"):
         df = pd.DataFrame(products)
-        # fill missing prices
         df["P"] = df.apply(lambda r: r.get("P") or cenik.get(r.get("C")), axis=1)
-        out = io.BytesIO()
-        df.to_excel(out, index=False, sheet_name="Products")
+        buffer = io.BytesIO()
+        df.to_excel(buffer, index=False, sheet_name="Products")
 
     st.success("Hotovo! Excel je připraven.")
     st.download_button(
-        "📥 Stáhnout Excel",
-        out.getvalue(),
+        label="📥 Stáhnout Excel",
+        data=buffer.getvalue(),
         file_name="products.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
