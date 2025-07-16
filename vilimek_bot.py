@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-Universal PDF catalog to Heureka XML exporter.
-
-Usage:
-    python universal_parser.py <catalog.pdf> <cenik.txt> <output.xml>
-
-This script will:
- 1. Parse the price list (cenik) into a mapping key→price
- 2. Try to extract a table from the PDF via Camelot
- 3. If Camelot finds no tables, fallback to pdfplumber + OpenAI GPT to parse the text
- 4. Map the resulting DataFrame into Heureka SHOP XML format and write to output.xml
-"""
-
 import sys
 import io
 import re
