@@ -1,156 +1,113 @@
-import streamlit as st
-import sys
+#!/usr/bin/env python3
 import io
 import re
-import json
-import camelot
+import camelot        # pip install camelot-py[cv]
 import pdfplumber
 import pandas as pd
-import openai
 import xml.etree.ElementTree as ET
-from xml.dom import minidom
 
-# ——— 1) Configure your OpenAI API key ——————————————————————————————
-openai.api_key = "OPENAI_API_KEY"  # Or set via environment variable
+# ——— CONFIG ——————————————————————————————————————————————
+PDF_PATH      = "Del-Conca-Lavaredo-Katalog-produktu.pdf"
+CENIK_PATH    = "cenik.txt"
+TEMPLATE_XML  = "resultFromUIForImport.xml"
+OUTPUT_XML    = "exported.xml"
 
-# ——— 2) Heureka XML namespace & columns A–U definition ——————————————
-NS = "http://www.heureka.cz/ns/offer/1.0"
-ET.register_namespace('', NS)
+# Heureka XML namespace
+NS = {"h": "http://www.heureka.cz/ns/offer/1.0"}
+ET.register_namespace('', NS["h"])
 
-COLUMNS = [
-    ("A","Název Keramičky"),
-    ("B","Název kolekce"),
-    ("C","Produktový kód"),
-    ("D","Název produktu"),
-    ("E","Barva"),
-    ("F","Materiál - Rektifikovaný (0/1)"),
-    ("G","Povrch (Matný/Lesklý)"),
-    ("H","Hlavní obrázek (valid URL)"),
-    ("I","Váha (kg)"),
-    ("J","Šířka"),
-    ("K","Výška"),
-    ("L","Tloušťka"),
-    ("M","Specifikace (Protiskluz R9–R12)"),
-    ("N","Tvar"),
-    ("O","Estetický vzhled"),
-    ("P","Cena (EUR)"),
-    ("Q","Materiál (typ střepu)"),
-    ("R","Použití"),
-    ("S","Hlavní kategorie"),
-    ("T","Jednotka"),
-    ("U","Velikost balení"),
-]
+# The minimal set of XML tags we want to fill. You can extend this dict
+# with more tags from your template as needed.
+XML_FIELD_MAP = {
+    "ITEM_ID":      ("C", str),   # Produktový kód → ITEM_ID
+    "PRODUCTNAME":  ("D", str),   # Název produktu → PRODUCTNAME
+    "CATEGORIES":   ("S", str),   # Hlavní kategorie → CATEGORIES
+    "WEIGHT":       ("I", float), # Váha → WEIGHT
+    "NETTO_PRICE":  ("P", float), # Cena → NETTO_PRICE
+    # add more mappings here...
+}
 
-BASE_PROMPT = """
-Máš za úkol extrahovat všechny produkty z katalogu do JSON pole, kde každý objekt obsahuje přesně tyto sloupce A–U (klíče "A" až "U"):
-
-{cols}
-
-Níže je vstupní text z PDF (nebo čistý text v případě selhání tabulkového parseru). Vrať pouze JSON pole, bez dalšího komentáře:
-
----
-{data}
----
-""".strip()
-
-def parse_price_file(raw_text: str) -> dict:
-    """
-    Z libovolného textu (ceník.txt, CSV, TSV) vytáhne mapování key→float price.
-    """
+def parse_price_list(path):
     price_map = {}
-    for line in raw_text.splitlines():
-        m = re.match(r"(.+?)\s+([\d.,]+)\s*€", line)
-        if m:
-            key = m.group(1).strip()
-            price = float(m.group(2).replace(",", "."))
-            price_map[key] = price
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"(.+?)\s+([\d.,]+)\s*€", line)
+            if m:
+                key = m.group(1).strip()
+                price = float(m.group(2).replace(",", "."))
+                price_map[key] = price
     return price_map
 
-def parse_pdf_universal(pdf_bytes: bytes, price_map: dict) -> pd.DataFrame:
-    """
-    1) Zkus camelot na detekci tabulek
-    2) Pokud selže, fallback na pdfplumber + GPT
-    """
-    # 1) Camelot table extraction
+def extract_table_from_pdf(path):
+    b = open(path, "rb").read()
+    # 1) Try Camelot
     try:
-        tables = camelot.read_pdf(io.BytesIO(pdf_bytes), pages="all", flavor="stream")
-        if tables and len(tables) > 0:
-            # choose the largest table by row count
+        tables = camelot.read_pdf(io.BytesIO(b), pages="all", flavor="stream")
+        if tables:
             df = max((t.df for t in tables), key=lambda d: d.shape[0])
-            df.columns = df.iloc[0]      # first row as header
+            df.columns = df.iloc[0]
             df = df.drop(0).reset_index(drop=True)
             return df
     except Exception:
         pass
 
-    # 2) Fallback: plain text & GPT
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        text = "\n\n".join(p.extract_text() or "" for p in pdf.pages)
+    # 2) Fallback: plain text + split on whitespace
+    with pdfplumber.open(io.BytesIO(b)) as pdf:
+        text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    rows = []
+    for line in text.splitlines():
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) >= 6 and re.match(r"^\d", parts[0]):
+            rows.append(parts)
+    # you will need to adjust this to your PDF’s actual column layout!
+    cols = ["size","pieces","sqm","kg","boxes","total_sqm","total_kg"]
+    df = pd.DataFrame(rows, columns=cols[:len(rows[0])])
+    return df
 
-    cols_descr = "\n".join(f"{k}: {v}" for k,v in COLUMNS)
-    prompt = BASE_PROMPT.format(cols=cols_descr, data=text)
+def build_heureka_xml(df, price_map, template_path, output_path):
+    # Load template
+    tree = ET.parse(template_path)
+    root = tree.getroot()
 
-    resp = openai.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0,
-        max_tokens=2000,
-    )
-    content = resp.choices[0].message.content.strip()
-    data = json.loads(content)
-    return pd.DataFrame(data)
+    # Remove any existing SHOPITEMs
+    for item in root.findall("h:SHOPITEM", NS):
+        root.remove(item)
 
-def dataframe_to_heureka_xml(df: pd.DataFrame, default_manufacturer="Del Conca / Faetano") -> bytes:
-    """
-    Convert a DataFrame into Heureka SHOP XML.
-    Expects df columns to include at least:
-    ITEM_ID, PRODUCTNAME, and PARAM_<field> for any A–U or other parameters.
-    """
-    shop = ET.Element(f"{{{NS}}}SHOP", desc="export from universal parser")
+    # For each row in df, create a new SHOPITEM
     for _, row in df.iterrows():
-        item = ET.SubElement(shop, f"{{{NS}}}SHOPITEM")
-        def add(tag, text):
-            el = ET.SubElement(item, f"{{{NS}}}{tag}")
-            el.text = str(text) if text is not None else ""
+        item = ET.SubElement(root, f"{{{NS['h']}}}SHOPITEM")
+        # Fill direct tags
+        for tag, (col, caster) in XML_FIELD_MAP.items():
+            val = row.get(col)
+            # if that column doesn’t exist in df, skip
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            # if this is a key that we need to look up in the price map:
+            if tag == "NETTO_PRICE":
+                # try matching by size or code
+                price = price_map.get(str(row.get("C"))) or price_map.get(str(row.get("size")))
+                val = price or val
+            el = ET.SubElement(item, f"{{{NS['h']}}}{tag}")
+            el.text = str(caster(val))
 
-        # Basic required tags (customize mapping as needed)
-        add("ITEM_ID",      row.get("C", ""))  # Produktový kód
-        add("PRODUCTNAME",  row.get("D", ""))  # Název produktu
-        add("MANUFACTURER", row.get("A", default_manufacturer))
+        # Example: add PARAM blocks for A–U if you want them in PARAM tags
+        #for col in ["A","B","E","F","G","H","J","K","L","M","N","O","Q","R","T","U"]:
+        #    if col in row and pd.notna(row[col]):
+        #        p = ET.SubElement(item, f"{{{NS['h']}}}PARAM")
+        #        name = ET.SubElement(p, f"{{{NS['h']}}}PARAM_NAME"); name.text = col
+        #        v    = ET.SubElement(p, f"{{{NS['h']}}}VAL");        v.text  = str(row[col])
 
-        # Example PARAMs for A–U
-        for col_key, col_name in COLUMNS:
-            val = row.get(col_key)
-            if pd.notna(val) and val != "":
-                param = ET.SubElement(item, f"{{{NS}}}PARAM")
-                name = ET.SubElement(param, f"{{{NS}}}PARAM_NAME"); name.text = col_name
-                v = ET.SubElement(param, f"{{{NS}}}VAL");        v.text  = str(val)
-
-    rough = ET.tostring(shop, 'utf-8')
-    parsed = minidom.parseString(rough)
-    return parsed.toprettyxml(indent="  ", encoding="UTF-8")
-
-def main():
-    if len(sys.argv) != 4:
-        print(__doc__)
-        sys.exit(1)
-    pdf_path, cenik_path, output_path = sys.argv[1:]
-
-    # Read inputs
-    pdf_bytes = open(pdf_path, "rb").read()
-    raw_cenik = open(cenik_path, encoding="utf-8").read()
-    price_map = parse_price_file(raw_cenik)
-    print(f"Loaded {len(price_map)} price entries")
-
-    # Parse PDF
-    df = parse_pdf_universal(pdf_bytes, price_map)
-    print(f"Extracted DataFrame with {len(df)} rows")
-
-    # Convert to XML and save
-    xml_bytes = dataframe_to_heureka_xml(df)
+    # Pretty-print and write
+    rough = ET.tostring(root, encoding="utf-8")
+    from xml.dom import minidom
+    doc = minidom.parseString(rough)
     with open(output_path, "wb") as f:
-        f.write(xml_bytes)
-    print(f"Wrote Heureka XML to {output_path}")
+        f.write(doc.toprettyxml(indent="  ", encoding="UTF-8"))
 
 if __name__ == "__main__":
-    main()
+    price_map = parse_price_list(CENIK_PATH)
+    print(f"Prices: {len(price_map)} items")
+    df = extract_table_from_pdf(PDF_PATH)
+    print(f"Extracted table with {len(df)} rows and columns: {list(df.columns)}")
+    build_heureka_xml(df, price_map, TEMPLATE_XML, OUTPUT_XML)
+    print("Wrote:", OUTPUT_XML)
