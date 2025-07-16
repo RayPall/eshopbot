@@ -1,120 +1,132 @@
-#!/usr/bin/env python3
-import os
 import io
 import re
-import sys
-import camelot        # pip install camelot-py[cv]
-import pdfplumber    # pip install pdfplumber
-import pandas as pd  # pip install pandas
+import pandas as pd
+import pdfplumber
+import streamlit as st
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
-# -------------- CONFIG --------------
-INPUT_DIR    = "./inputs"                   # place your PDFs + price-lists here
-TEMPLATE_XML = "resultFromUIForImport.xml"  # your existing XML template
-OUTPUT_XML   = "exported_universal.xml"     # where to write the result
-# -------------------------------------
+st.set_page_config(page_title="Universal Heureka Exporter", layout="wide")
+st.title("🛠️ Universal PDF → Heureka XML Exporter (Streamlit)")
 
-NS = {"h": "http://www.heureka.cz/ns/offer/1.0"}
-ET.register_namespace('', NS["h"])
+# 1) Uploaders
+st.markdown("#### 1️⃣ Nahrajte všechny soubory najednou")
+uploaded = st.file_uploader(
+    label="Vyberte PDF katalogy, ceník (.txt/.csv) a XML šablonu",
+    type=["pdf","txt","csv","xml"],
+    accept_multiple_files=True
+)
 
-def parse_all_price_lists(folder):
-    """Scan folder for .txt/.csv and build a single key→float map."""
-    price_map = {}
-    for fn in os.listdir(folder):
-        if fn.lower().endswith((".txt",".csv")):
-            path = os.path.join(folder, fn)
-            text = open(path, encoding="utf-8", errors="ignore").read()
-            for line in text.splitlines():
+if uploaded:
+    # Separate by extension
+    pdf_files   = [f for f in uploaded if f.name.lower().endswith(".pdf")]
+    price_files = [f for f in uploaded if f.name.lower().endswith((".txt",".csv"))]
+    xml_templates = [f for f in uploaded if f.name.lower().endswith(".xml")]
+
+    st.write(f"- Katalogy (PDF): {len(pdf_files)}") 
+    st.write(f"- Ceníky (.txt/.csv): {len(price_files)}")
+    st.write(f"- Šablony XML: {len(xml_templates)}")
+
+    # Let user choose their template if more than one
+    template_file = None
+    if xml_templates:
+        names = [f.name for f in xml_templates]
+        choice = st.selectbox("Vyberte Heureka XML šablonu", ["–"] + names)
+        if choice != "–":
+            template_file = next(f for f in xml_templates if f.name==choice)
+
+    # Only enable when we have at least one PDF, one price-list, and a template
+    if st.button("🔄 Generovat výsledné XML"):
+        # Validation
+        if not pdf_files:
+            st.error("Potřebujete nahrát alespoň jeden PDF katalog.")
+            st.stop()
+        if not price_files:
+            st.error("Potřebujete nahrát alespoň jeden ceník (.txt/.csv).")
+            st.stop()
+        if template_file is None:
+            st.error("Vyberte prosím XML šablonu.")
+            st.stop()
+
+        # 2) Parse price-lists into a single dict
+        price_map = {}
+        for pf in price_files:
+            txt = pf.getvalue().decode("utf-8", errors="ignore")
+            for line in txt.splitlines():
                 m = re.match(r"(.+?)\s+([\d.,]+)\s*€", line)
                 if m:
                     key = m.group(1).strip()
-                    price_map[key] = float(m.group(2).replace(",","."))
-    print(f"Parsed prices: {len(price_map)} entries")
-    return price_map
+                    price_map[key] = float(m.group(2).replace(",", "."))
+        if not price_map:
+            st.warning("Ceník byl načten, ale nenašel jsem žádné ceny (klíče → číslo €).")
+        else:
+            st.success(f"Načteno {len(price_map)} cenových položek.")
 
-def extract_table(path):
-    """Try Camelot, otherwise pdfplumber + whitespace split."""
-    b = open(path,"rb").read()
-    try:
-        tables = camelot.read_pdf(io.BytesIO(b), pages="all", flavor="stream")
-        if tables:
-            # take largest
-            df = max((t.df for t in tables), key=lambda d: d.shape[0])
-            df.columns = df.iloc[0]
-            return df.drop(0).reset_index(drop=True)
-    except Exception:
-        pass
+        # 3) Extract tables from PDFs into one DataFrame
+        all_rows = []
+        for pdf in pdf_files:
+            raw = pdf.getvalue()
+            with pdfplumber.open(io.BytesIO(raw)) as doc:
+                text = "\n".join(p.extract_text() or "" for p in doc.pages)
+            for line in text.splitlines():
+                parts = re.split(r"\s{2,}", line.strip())
+                # Heuristic: first token contains a digit
+                if len(parts)>=2 and re.search(r"\d", parts[0]):
+                    parts.append(pdf.name)  # track source
+                    all_rows.append(parts)
 
-    # fallback
-    with pdfplumber.open(io.BytesIO(b)) as pdf:
-        text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-    rows=[]
-    for L in text.splitlines():
-        parts = re.split(r"\s{2,}", L.strip())
-        if len(parts)>=2 and any(c.isdigit() for c in parts[0]):
-            rows.append(parts)
-    if not rows:
-        return pd.DataFrame()
-    # header = first row if it is all non-numeric
-    header = rows[0] if not any(ch.isdigit() for ch in "".join(rows[0])) else None
-    data = rows[1:] if header else rows
-    cols = header or [f"col_{i}" for i in range(len(data[0]))]
-    return pd.DataFrame(data, columns=cols)
+        if not all_rows:
+            st.error("Nepodařilo se najít žádné řádky produktů v PDF.")
+            st.stop()
 
-def build_universal_df(input_dir):
-    """Load all PDFs, extract tables, concat into one DF."""
-    dfs=[]
-    for fn in os.listdir(input_dir):
-        if fn.lower().endswith(".pdf"):
-            path = os.path.join(input_dir, fn)
-            print("Extracting:", fn)
-            df = extract_table(path)
-            df["__source_file"] = fn
-            dfs.append(df)
-    if not dfs:
-        print("No PDF tables found.")
-        sys.exit(1)
-    return pd.concat(dfs, ignore_index=True)
+        # Build DataFrame: header = first row if non-numeric, else generic
+        header = all_rows[0] if not re.search(r"\d", "".join(all_rows[0])) else None
+        data_rows = all_rows[1:] if header else all_rows
+        columns = header or [f"col{i}" for i in range(len(data_rows[0]))] + ["source"]
+        df = pd.DataFrame(data_rows, columns=columns + (["source"] if header else []))
 
-def write_heureka_xml(df, price_map, template_xml, output_xml):
-    """Remove existing SHOPITEMs, then append one per DataFrame row."""
-    tree = ET.parse(template_xml)
-    root = tree.getroot()
-    # remove old items
-    for it in root.findall("h:SHOPITEM", NS):
-        root.remove(it)
+        st.write("▶️ Ukázka extrahovaných řádků")
+        st.dataframe(df.head())
 
-    for _, row in df.iterrows():
-        item = ET.SubElement(root, f"{{{NS['h']}}}SHOPITEM")
-        # Minimal required tags
-        code = row.get("Produktový kód") or row.get(row.index[0])  # try header 'Produktový kód' or first column
-        ET.SubElement(item, f"{{{NS['h']}}}ITEM_ID").text = str(code)
-        ET.SubElement(item, f"{{{NS['h']}}}PRODUCTNAME").text = str(code)
+        # 4) Load XML template
+        tree = ET.parse(io.BytesIO(template_file.getvalue()))
+        root = tree.getroot()
+        ns = {"h": root.tag.split("}")[0].strip("{")}
 
-        # Price lookup
-        price = price_map.get(str(code)) or price_map.get(str(row.get("col_1","")))
-        if price is not None:
-            ET.SubElement(item, f"{{{NS['h']}}}NETTO_PRICE").text = str(price)
+        # remove existing SHOPITEMs
+        for existing in root.findall("h:SHOPITEM", ns):
+            root.remove(existing)
 
-        # Generic PARAM for every column in the DF
-        for col in df.columns:
-            val = row[col]
-            if pd.isna(val) or col=="__source_file":
-                continue
-            p = ET.SubElement(item, f"{{{NS['h']}}}PARAM")
-            ET.SubElement(p, f"{{{NS['h']}}}PARAM_NAME").text = str(col)
-            ET.SubElement(p, f"{{{NS['h']}}}VAL").text = str(val)
+        # 5) Inject one SHOPITEM per DataFrame row
+        for _, row in df.iterrows():
+            itm = ET.SubElement(root, f"{{{ns['h']}}}SHOPITEM")
+            # ITEM_ID & PRODUCTNAME = first column
+            code = str(row[columns[0]])
+            ET.SubElement(itm, f"{{{ns['h']}}}ITEM_ID").text     = code
+            ET.SubElement(itm, f"{{{ns['h']}}}PRODUCTNAME").text = code
 
-    # pretty write
-    rough = ET.tostring(root, "utf-8")
-    pretty = minidom.parseString(rough).toprettyxml(indent="  ", encoding="UTF-8")
-    with open(output_xml, "wb") as f:
-        f.write(pretty)
-    print("Wrote XML:", output_xml)
+            # NETTO_PRICE from price_map if possible
+            price = price_map.get(code) or price_map.get(str(row.get(columns[1],"")))
+            if price is not None:
+                ET.SubElement(itm, f"{{{ns['h']}}}NETTO_PRICE").text = str(price)
 
-if __name__=="__main__":
-    pm = parse_all_price_lists(INPUT_DIR)
-    df = build_universal_df(INPUT_DIR)
-    print("Combined DataFrame shape:", df.shape)
-    write_heureka_xml(df, pm, TEMPLATE_XML, OUTPUT_XML)
+            # generic PARAM blocks for every column
+            for col in columns:
+                val = row[col]
+                if pd.isna(val) or val=="":
+                    continue
+                p = ET.SubElement(itm, f"{{{ns['h']}}}PARAM")
+                ET.SubElement(p, f"{{{ns['h']}}}PARAM_NAME").text = col
+                ET.SubElement(p, f"{{{ns['h']}}}VAL").text        = str(val)
+
+        # 6) Pretty-print and offer download
+        rough = ET.tostring(root, encoding="utf-8")
+        pretty = minidom.parseString(rough).toprettyxml(indent="  ", encoding="UTF-8")
+
+        st.success("✨ XML bylo vygenerováno!")
+        st.download_button(
+            label="📥 Stáhnout výstupní XML",
+            data=pretty,
+            file_name="exported_universal.xml",
+            mime="application/xml"
+        )
