@@ -19,10 +19,11 @@ openai.api_key = os.getenv("OPENAI_API_KEY") or st.text_input(
 st.markdown("### 1️⃣ Nahrajte vstupní soubory (PDF, ceník, nebo jiné)")
 uploaded_files = st.file_uploader(
     "Vyberte všechny soubory najednou",
-    type=None,  # žádné omezení typů
+    type=None,
     accept_multiple_files=True
 )
 
+# 3) Spouštěcí tlačítko
 if st.button("Generovat Excel"):
 
     if not openai.api_key:
@@ -31,7 +32,7 @@ if st.button("Generovat Excel"):
     if not uploaded_files:
         st.error("Nenahráli jste žádné soubory"); st.stop()
 
-    # 3) Roztřídění souborů podle přípony
+    # Rozdělení souborů
     pdfs = [f for f in uploaded_files if f.name.lower().endswith(".pdf")]
     txts = [f for f in uploaded_files if f.name.lower().endswith(".txt")]
 
@@ -40,7 +41,10 @@ if st.button("Generovat Excel"):
     if not txts:
         st.error("Chybí textový ceník (.txt)"); st.stop()
 
-    pdf_file = pdfs[0]        # vezmeme první PDF
-    cenik_file = txts[0]      # a první .txt jako ceník
+    pdf_file = pdfs[0]
+    cenik_file = txts[0]
 
-    # … pokračuje zbytek kódu beze změny …
+    # 4) Vlastní zpracování pod spinnerem
+    with st.spinner("Extrahuji text z PDF…"):
+        with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
+            ful
