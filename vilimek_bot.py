@@ -32,10 +32,11 @@ prices_txt = [f for f in uploaded if f.name.lower().endswith((".txt","csv"))]
 prices_xlsx= [f for f in uploaded if f.name.lower().endswith(".xlsx")]
 templates  = [f for f in uploaded if f.name.lower().endswith(".xml")]
 
-st.markdown(f"- 📑 **PDF katalogů:** {len(pdfs)}  
+st.markdown(f"""- 📑 **PDF katalogů:** {len(pdfs)}  
 - 💲 **Ceníků (.txt/.csv):** {len(prices_txt)}  
 - 💲 **Ceníků (.xlsx):** {len(prices_xlsx)}  
-- 📄 **XML šablon:** {len(templates)}")
+- 📄 **XML šablon:** {len(templates)}
+""")
 
 # select exactly one template
 template_file = None
