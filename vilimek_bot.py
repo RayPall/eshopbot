@@ -143,7 +143,7 @@ if st.button("🚀 Generovat XML"):
             "ADDITIONAL_IMAGE_URLS": ["string"],
             "PARAMS": "object"
         }
-        prompt = f"""
+prompt = f"""
 You are an expert at extracting product data from catalogs.
 Extract *every* product into a JSON array matching this schema:
 
@@ -154,9 +154,8 @@ Use this price map for NETTO_PRICE (key→price):
 {json.dumps(price_map, ensure_ascii=False)}
 Catalog filename: {pdf.name}
 Catalog text excerpt: {text[:2000]}
-        Return ONLY a valid JSON array.
-"""
-            resp = openai.chat.completions.create(
+ Return ONLY a valid JSON array."""
+        resp = openai.chat.completions.create(
         model="gpt-4",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
